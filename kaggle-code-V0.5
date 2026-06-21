@@ -1,0 +1,294 @@
+# ==============================================================================
+# 1. DEPENDENCY INSTALLATION & CONFIGURATION
+# ==============================================================================
+print("[SYSTEM] Installing required Qwen 3.5 dependencies...")
+!pip install -q "transformers>=5.2.0" "accelerate>=0.26.0" "hf-transfer"
+
+import os
+import gc
+import math
+import string
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ------------------------------------------------------------------------------
+# HUGGING FACE CREDENTIALS & DOWNLOAD SPEEDUP
+# ------------------------------------------------------------------------------
+HF_TOKEN = "your_hf_token_here"
+
+if HF_TOKEN and HF_TOKEN != "your_hf_token_here":
+    os.environ["HF_TOKEN"] = HF_TOKEN
+
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# 2. RUNTIME CONFIGURATION (HIGHLY CONFIGURABLE)
+# ==============================================================================
+chat_config = {
+    "num_candidates": 8,          # Total candidates to choose from. (8 is a good balance)
+    "parallel_candidates": 4,     # Try 4 at 0.8B and 2 at 4B.
+                                  # Anything higher requires quantization, but setting to 1 will help.
+    "max_new_tokens": 2048,       # reduce parallel candidates if you want to increase this.
+    "temperature": 0.8,           # try 0.7 if using <5 candidates.
+    "top_p": 0.8,                 
+    
+    "metric": "entropy",          
+    "K": 0.15,                    
+    "aggregation": "median",      
+    "filter_non_semantic": True   # Improves knowledge and math, may worsen code.
+}
+
+# The reasoning-native model
+model_id = "Qwen/Qwen3.5-0.8B" # try Qwen/Qwen3.5-4B if you have a lot of patience
+
+# ==============================================================================
+# 3. HIGH-PERFORMANCE MODEL LOADING (NATIVE FP16 FOR T4)
+# ==============================================================================
+print(f"[SYSTEM] Loading {model_id} in native FP16 on T4...")
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Load model natively in FP16 to utilize T4 Tensor Cores without quantization lag
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,         # Native FP16 (essential speedup for T4)
+    device_map="auto",
+    attn_implementation="sdpa"         # Fast Scaled Dot Product Attention
+)
+print("[SYSTEM] Model loaded successfully.")
+
+# ==============================================================================
+# 4. UNCERTAINTY COMPUTATION FUNCTION
+# ==============================================================================
+def calculate_aggregate_uncertainty(candidate, metric="entropy", K=0.15, aggregation="median", filter_non_semantic=True):
+    if metric == "entropy":
+        scores_list = candidate["token_entropies"]
+    elif metric == "logprob":
+        scores_list = candidate["token_logprobs"]
+    elif metric == "margin":
+        scores_list = candidate["token_margins"]
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+        
+    tokens = candidate["tokens"]
+    if len(scores_list) == 0:
+        return float('inf')  
+        
+    paired = list(zip(scores_list, tokens))
+    
+    if filter_non_semantic:
+        filtered_paired = []
+        for val, tok in paired:
+            is_noise = all(c in string.punctuation or c.isspace() for c in tok) or tok == ""
+            if not is_noise:
+                filtered_paired.append((val, tok))
+        paired = filtered_paired
+        
+    if len(paired) == 0:
+        return float('inf') 
+        
+    uncertainties = []
+    for val, _ in paired:
+        if metric == 'logprob':
+            uncertainties.append(-val)  
+        elif metric == 'entropy':
+            uncertainties.append(val)   
+        elif metric == 'margin':
+            uncertainties.append(1.0 - val) 
+            
+    uncertainties.sort(reverse=True)
+    
+    if K is None or (isinstance(K, float) and math.isinf(K)) or K == float('inf'):
+        slice_K = uncertainties
+    elif isinstance(K, float) and 0.0 < K < 1.0:
+        K_int = max(1, int(round(K * len(uncertainties))))
+        slice_K = uncertainties[:K_int]
+    else:
+        K_int = int(round(K))
+        slice_K = uncertainties[:K_int] if K_int < len(uncertainties) else uncertainties
+        
+    if len(slice_K) == 0:
+        return float('inf')
+        
+    if aggregation == "mean":
+        return sum(slice_K) / len(slice_K)
+    elif aggregation == "median":
+        import statistics
+        return statistics.median(slice_K)
+    return sum(slice_K) / len(slice_K)
+
+# ==============================================================================
+# 5. CHUNKED PARALLEL/SEQUENTIAL CANDIDATE GENERATION ENGINE
+# ==============================================================================
+def generate_candidates(model, tokenizer, history, config):
+    inputs = tokenizer.apply_chat_template(
+        history, 
+        tokenize=True, 
+        add_generation_prompt=True, 
+        return_tensors="pt"
+    ).to(model.device)
+    
+    input_ids = inputs["input_ids"]
+    input_len = input_ids.shape[1]
+    
+    total_candidates = config.get("num_candidates", 4)
+    parallel_candidates = config.get("parallel_candidates", total_candidates)
+    
+    # Cap parallel generation count to total requested candidates
+    parallel_candidates = max(1, min(parallel_candidates, total_candidates))
+    
+    max_new_tokens = config.get("max_new_tokens", 512)
+    temperature = config.get("temperature", 0.7)
+    top_p = config.get("top_p", 0.8)
+    
+    num_passes = math.ceil(total_candidates / parallel_candidates)
+    candidates = []
+    
+    for pass_idx in range(num_passes):
+        current_batch_size = min(parallel_candidates, total_candidates - len(candidates))
+        if current_batch_size <= 0:
+            break
+            
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                num_return_sequences=current_batch_size,
+                temperature=temperature,
+                top_p=top_p,
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+            
+        # --- VECTORIZED GPU METRIC EVALUATION (No Python Loops) ---
+        if len(outputs.scores) > 0:
+            # Stack scores: (gen_len, current_batch_size, vocab_size) -> (current_batch_size, gen_len, vocab_size)
+            scores_tensor = torch.stack(outputs.scores, dim=0).permute(1, 0, 2)
+            
+            with torch.no_grad():
+                probs_tensor = torch.softmax(scores_tensor, dim=-1)
+                logprobs_tensor = torch.log(probs_tensor + 1e-12)
+                
+                # Vectorized Entropy
+                entropies_tensor = -torch.sum(probs_tensor * logprobs_tensor, dim=-1)
+                
+                # Vectorized Margin
+                top_vals, _ = torch.topk(probs_tensor, 2, dim=-1)
+                margins_tensor = top_vals[..., 0] - top_vals[..., 1]
+                
+                # Vectorized Logprobs for Selected Tokens
+                gen_ids_tensor = outputs.sequences[:, input_len : input_len + scores_tensor.shape[1]]
+                selected_logprobs_tensor = torch.gather(logprobs_tensor, dim=-1, index=gen_ids_tensor.unsqueeze(-1)).squeeze(-1)
+                
+                # Single-batch transfer to CPU to minimize PCIe overhead
+                entropies_cpu = entropies_tensor.cpu().numpy()
+                logprobs_cpu = selected_logprobs_tensor.cpu().numpy()
+                margins_cpu = margins_tensor.cpu().numpy()
+        else:
+            entropies_cpu = logprobs_cpu = margins_cpu = None
+        # -----------------------------------------------------------
+            
+        for i in range(current_batch_size):
+            generated_ids = outputs.sequences[i, input_len:]
+            
+            # Safely identify EOS token
+            eos_indices = (generated_ids == tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            actual_gen_len = len(generated_ids)
+            if len(eos_indices) > 0:
+                actual_gen_len = eos_indices[0].item()
+                
+            score_len = min(actual_gen_len, len(outputs.scores))
+            valid_gen_ids = generated_ids[:score_len]
+            gen_text = tokenizer.decode(valid_gen_ids, skip_special_tokens=True)
+            
+            # Map values directly from pre-computed numpy matrices
+            if entropies_cpu is not None and score_len > 0:
+                token_entropies = entropies_cpu[i, :score_len].tolist()
+                token_logprobs = logprobs_cpu[i, :score_len].tolist()
+                token_margins = margins_cpu[i, :score_len].tolist()
+            else:
+                token_entropies, token_logprobs, token_margins = [], [], []
+                
+            # Fast decoding by passing scalar integers directly
+            tokens_list = [tokenizer.decode(tid) for tid in valid_gen_ids.tolist()]
+            
+            candidates.append({
+                "text": gen_text,
+                "token_logprobs": token_logprobs,
+                "token_entropies": token_entropies,
+                "token_margins": token_margins,
+                "tokens": tokens_list
+            })
+            
+        # Clean up memory allocated inside this iteration to avoid VRAM fragmentation
+        has_scores = len(outputs.scores) > 0
+        del outputs
+        if has_scores:
+            del scores_tensor, entropies_tensor, probs_tensor, logprobs_tensor, margins_tensor, selected_logprobs_tensor, gen_ids_tensor
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+    return candidates
+
+# ==============================================================================
+# 6. INTERACTIVE MULTI-TURN CHAT INTERACTION
+# ==============================================================================
+chat_history = []
+
+print("\n" + "="*70)
+print("=== INTERACTIVE MULTI-TURN CHAT (UNCERTAINTY-SELECTION ACTIVE) ===")
+print("="*70)
+print(f"Selection Logic: {chat_config['metric'].upper()} | K={chat_config['K']} | Aggregation={chat_config['aggregation'].upper()} | NoiseFilter={chat_config['filter_non_semantic']}")
+print(f"Generating N={chat_config['num_candidates']} candidates per turn (using parallel batch size of {chat_config['parallel_candidates']}). Type 'exit' or 'quit' to stop.\n")
+
+while True:
+    try:
+        user_input = input("User: ")
+    except EOFError:
+        break
+        
+    if user_input.strip().lower() in ["exit", "quit"]:
+        print("\nChat session stopped.")
+        break
+        
+    if not user_input.strip():
+        continue
+        
+    chat_history.append({"role": "user", "content": user_input})
+    
+    candidates = generate_candidates(model, tokenizer, chat_history, chat_config)
+    
+    best_candidate = None
+    best_score = float('inf')
+    
+    print("\n" + "-"*45)
+    print(" CANDIDATE SELECTION EVALUATION LOG:")
+    print("-"*45)
+    for idx, cand in enumerate(candidates):
+        score = calculate_aggregate_uncertainty(
+            cand,
+            metric=chat_config["metric"],
+            K=chat_config["K"],
+            aggregation=chat_config["aggregation"],
+            filter_non_semantic=chat_config["filter_non_semantic"]
+        )
+        preview = cand["text"].replace("\n", " ")[:50]
+        print(f" -> Candidate {idx+1} [Score: {score:.5f}] | Preview: \"{preview}...\"")
+        
+        if score < best_score:
+            best_score = score
+            best_candidate = cand
+            
+    if best_candidate is None:
+        best_candidate = candidates[0]
+        
+    print("-"*45)
+    print(f"Selected Option {candidates.index(best_candidate) + 1} with the lowest uncertainty metric.")
+    print(f"Assistant: {best_candidate['text']}\n")
+    print("="*70 + "\n")
+    
+    chat_history.append({"role": "assistant", "content": best_candidate["text"]})
